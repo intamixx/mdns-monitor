@@ -1,0 +1,321 @@
+#!/usr/bin/perl
+
+# Msingh
+# MDNS anycast DNS monitoring script
+
+use strict;
+use warnings;
+use MY::Config;
+use MY::DateUtils;
+use DBI;
+use File::Basename qw(basename);
+use Net::DNS;
+use Getopt::Long;
+use Mail::Sendmail;
+use Sys::Hostname;
+use Sys::Syslog qw(:standard :macros);
+use Pod::Usage;
+
+my $SELF = basename(__FILE__);
+
+my $SRVvpnquery = "_dns._udp.test-dns.com";
+my $dns = uc('ns0.test.net'); 
+
+my $host = "localhost";
+# Number of MDNS Domains to query for
+my $limit = "10";
+my $domain;
+my $database = "db";
+my $table = "records";
+### Enter DB username and password here
+my $username = "user";
+my $password = "password";
+my @soavalues;
+my $domainid;
+my $id;
+my $content;
+my $masterSerial;
+my $newSerial;
+my $timeout = 10; 
+my $ns; 
+my $masterSeriallength; 
+my $msg;
+
+# initialise various variables:
+my @errors      = ();
+my @log         = ();
+my $timefmt     = '%Y-%m-%d %H:%M:%S';
+my $cache       = {};
+
+my ($debug, $noalerts, $help, $noisy, $networks);
+GetOptions(
+        'noalerts'      => \$noalerts,
+        'help'          => \$help,
+        'verbose'       => \$debug,
+        'debug'         => \$debug,
+        'noisy'         => \$noisy,
+        'networks=s'    => \$networks,
+);
+
+pod2usage('-verbose' => 99, '-sections' => 'USAGE|OPTIONS') if ($help);
+
+    my $res = Net::DNS::Resolver->new( nameservers => [$dns], tcp_timeout => $timeout, udp_timeout => $timeout, retry => 3, 'persistent_tcp' => 1, 'persistent_udp' => 1, 'debug' => $noisy );
+
+        # Query SRV records
+        my @cloudresults = SRVquery ( $SRVvpnquery, $dns );
+
+        debug('Connecting to database server on '.$host);
+        my $dbh = DBI->connect(sprintf('DBI:mysql:database=%s;host=%s', $database, $host), $username, $password, { RaiseError => 1}) or add_error (sprintf("Couldn't connect to database: %s", DBI->errstr));;
+
+        # Check the table exists
+        my $sth = $dbh->table_info("", "", $table, "TABLE");
+                if (!($sth->fetch)) {
+                debug ("Table %s does not exist", $table);
+                }
+        $sth->finish;
+
+        # Get the id from the records table
+        my $sth1 = $dbh->prepare(sprintf('SELECT id, domain_id, name, content FROM %s WHERE type="SOA" ORDER BY change_date desc LIMIT %s', $table, $limit)) ||  die "$DBI::errstr";
+        $sth1->execute();
+
+                if ($sth1->rows >= 1) {
+                debug (sprintf(">> Found %d domains in table %s", $sth1->rows, $table));
+                }
+
+    while (my $results = $sth1->fetchrow_hashref) {
+        $id = $results->{id};
+        $domainid = $results->{domain_id};
+        $domain = $results->{name};
+        $content = $results->{content};
+        @soavalues = split(' ', $content);
+
+        debug (sprintf("    +--- %s %s %s \n\t%s", $id, $domainid, $domain, $content));
+
+                $masterSeriallength = length($soavalues[2]);
+                if ( ( $soavalues[2] =~ /\d+/ ) && ( $masterSeriallength <= 10 ) ) {
+                        $masterSerial = $soavalues[2];
+                        } else {
+                                add_error (sprintf("Problem with serial for %s (%s)", $domain, $soavalues[2]));
+                        next;
+                        }
+
+                debug ("Checking Serial numbers");
+
+        foreach $ns ( sort @{cloudresults}) {
+                undef my $serial;
+                $serial = getDNSdetails($ns);
+                        if (!defined($serial)) {
+                                debug ("No Serial number for $domain");
+                        } else {
+                                if ($serial == $masterSerial) {
+                                        debug (sprintf("%s is up to date on %s", $domain, $ns));
+                                } elsif ($serial > $masterSerial) {
+                                        debug(sprintf(
+                                                "NOTICE: serial number for %s on %s is %s (%d ahead of master)",
+                                                $domain, $ns, $serial,
+                                                ($serial - $masterSerial)
+                                        ));
+                                } else {
+                                        add_error (sprintf("serial number for %s on %s is %s (%d behind master)",
+                                                $domain, $ns, $serial,
+                                                ($masterSerial - $serial)
+                                        ));
+                                }
+                        }
+        }
+
+}
+        debug ("Disconnecting from database server");
+        $sth1->finish;
+        $dbh->disconnect;
+
+if (scalar(@errors) > 0) {
+        debug(sprintf("%d problems found", scalar(@errors)));
+
+        if ($noalerts) {
+                debug("email alert skipped");
+
+        } else {
+                my %mail = (
+                        'SMTP'          => $config->{'mail.smtphost'},
+                        'From'          => sprintf(
+                                                '"%s MDNS Monitor" <ops@%s>',
+                                                $config->{'company.sname'},
+                                                $config->{'company.domain'}
+                                        ),
+                        'To'            => sprintf(
+                                                'ops@%s',
+                                                $config->{'company.domain'}
+                                        ),
+                        'Subject'       => 'MDNS Monitor Report',
+                        'Body'          => sprintf(
+                                                "%s ran on %s and found %d ".
+                                                "problems:\n\n%s\n\n".
+                                                "Log:\n\n%s",
+                                                $SELF,
+                                                uc(hostname()),
+                                                scalar(@errors),
+                                                join("\n", @errors),
+                                                join("\n", @log)
+                                        ),
+                );
+
+                map { debug($_) } split(/\n/, $mail{'Body'});
+
+                if (!sendmail(%mail)) {
+                        debug("alert successfully sent to $mail{'To'}");
+
+                } else {
+                        syslog(LOG_ERR, $Mail::Sendmail::error);
+                        exit(1);
+
+                }
+
+        }
+
+} else {
+        debug("no problems found");
+}
+
+debug("done");
+
+sub getDNSdetails {
+
+        my ( $ns ) = @_;
+
+# Run a SOA query against all nameservers
+
+  # Set the resolver to query this nameserver.
+    unless ($res->nameservers($ns)) {
+        add_error (sprintf("%s can't find address for %s : %s", $ns, $domain, $res->errorstring));
+        next;
+    }
+
+    # Get the SOA record.
+    #
+    my $soa_req = $res->send($domain, "SOA");
+    unless (defined($soa_req)) {
+        add_error (sprintf("%s for %s : %s ", $ns, $domain, $res->errorstring));
+        next;
+    }
+
+    # Is this nameserver authoritative for the domain?
+    #
+    unless ($soa_req->header->aa) {
+        add_error (sprintf("%s is not authoritative for %s", $ns, $domain));
+        next;
+    }
+
+    # We should have received exactly one answer.
+    #
+    unless ($soa_req->header->ancount == 1) {
+        add_error (sprintf("%s expected 1 answer, got %s for %s", $ns, $soa_req->header->ancount, $domain));
+        next;
+    }
+
+    # Did we receive an SOA record?
+    #
+    unless (($soa_req->answer)[0]->type eq "SOA") {
+        add_error (sprintf("%s expected SOA, got %s for %s", $ns, ($soa_req->answer)[0]->type, $domain));
+        next;
+    }
+
+    # Print the serial number.
+    #
+        return ($soa_req->answer)[0]->serial;
+
+}
+
+sub SRVquery {
+
+    my ( $srvquery, $dns ) = @_;
+    my $nameservers;
+
+    $res->nameservers($dns);
+    my $packet = $res->query($dns, "A");
+
+    if ( !$packet ) {
+        add_error ("Nameserver $dns not available");
+        exit;
+        }
+# Run the SRV query to get list of anycast nameservers against chosen authorative server
+
+        my $query = $res->query($srvquery, 'SRV');
+
+                if ( !($query) ) {
+                        add_error (sprintf(" *** Query failed: %s ***", $res->errorstring));
+                } else {
+
+                        foreach my $rr (grep{ $_->type eq 'SRV' }$query->answer) {
+                                push( @{$nameservers}, $rr->target );
+                        }
+                }
+        return @{$nameservers};
+}
+
+# emit a debug message, but also store it so that it can be included in the
+# error report:
+sub debug {
+        my $msg = shift;
+        print "$msg\n";
+        syslog(LOG_DEBUG, $msg);
+        push(@log, sprintf("%s: %s", strftime($timefmt, time()), $msg));
+}
+
+# log an error for inclusion in the report:
+sub add_error {
+        my $error = shift;
+        debug "$error\n";
+        syslog(LOG_ERR, "ERROR: $error");
+        push(@errors, sprintf(
+                "%s: ERROR: %s",
+                strftime($timefmt, time()),
+                $error
+        ));
+}
+
+__END__
+
+=pod
+
+=head1 NAME
+
+        mdns.monitor - a DNS monitoring script
+
+=head1 DESCRIPTION
+
+C<mdns.monitor> is a Perl script which checks the serial number of zone 
+files across multiple MDNS nodes networks to verify that zone updates are 
+propagating correctly. If errors are found, a NOC alert is raised.
+
+=head1 USAGE
+
+        mdns.monitor [OPTIONS]
+
+=head1 OPTIONS
+
+=over
+
+=item --help
+
+Show this help.
+
+=item --debug
+
+Show verbose debugging messages.
+
+=item --verbose
+
+Alias for --debug.
+
+=item --noalerts
+
+Disable email alerts when errors are found.
+
+=item --noisy
+
+Enable Net::DNS debug mode (WHICH IS VERY NOISY)
+
+=back
+
+=cut
